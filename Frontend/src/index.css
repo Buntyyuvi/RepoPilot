@@ -1,0 +1,192 @@
+@import "tailwindcss";
+
+/* ============================================================
+   EMERALD & IVORY THEME (permanent)
+   The palette is baked into the theme so utilities resolve to
+   these values directly. Red stays reserved for destructive/
+   error states and the default emerald for success states.
+   ------------------------------------------------------------
+   Palette:
+     #0F2E22  deep emerald (primary / black replacement)
+     #163D2C  emerald text (gray-900)
+     #C9A66B  gold accent (stars, badges, decorative icons)
+     #F4F1EA  ivory (background / white replacement)
+   ============================================================ */
+@theme {
+  /* Primary + surface */
+  --color-black: #0f2e22;
+  --color-white: #f4f1ea;
+
+  /* Surface text / backgrounds */
+  --color-gray-50: #f7f4ec;
+  --color-gray-100: #efebdf;
+  --color-gray-200: #e1dac8;
+  --color-gray-300: #cfc5ae;
+  --color-gray-400: #a9a08a;
+  --color-gray-500: #8c9b8e;
+  --color-gray-600: #67796d;
+  --color-gray-700: #4b5d52;
+  --color-gray-800: #33473c;
+  --color-gray-900: #163d2c;
+  --color-gray-950: #0f2e22;
+
+  /* Page background + dark sections */
+  --color-slate-50: #f4f1ea;
+  --color-slate-100: #eae4d4;
+  --color-slate-200: #dcd3ba;
+  --color-slate-300: #c5b898;
+  --color-slate-400: #ada083;
+  --color-slate-500: #8b7e68;
+  --color-slate-600: #6b5f4f;
+  --color-slate-700: #4d4538;
+  --color-slate-800: #332d26;
+  --color-slate-900: #1a2e24;
+
+  /* Gold accents (stars, CTA banners, badges) */
+  --color-amber-50: #faf3e3;
+  --color-amber-100: #f3e7cb;
+  --color-amber-200: #e9d6aa;
+  --color-amber-300: #dcc185;
+  --color-amber-400: #c9a66b;
+  --color-amber-500: #b18c4e;
+  --color-amber-600: #99743a;
+  --color-amber-700: #7e5f30;
+  --color-amber-800: #654b28;
+  --color-amber-900: #523e22;
+  --color-amber-950: #342a1b;
+
+  /* Decorative icon accents matched to the palette
+     (file-type icons, folder icons, quick-action icons) */
+  --color-sky-400: #57a684;
+  --color-sky-500: #2f7d5c;
+  --color-blue-500: #2f7d5c;
+  --color-blue-600: #1e5f44;
+  --color-violet-500: #c9a66b;
+  --color-purple-600: #b89455;
+  --color-orange-500: #c9a66b;
+}
+
+@layer base {
+  :root {
+    --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #f4f1ea;
+    color: #163d2c;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+  }
+}
+
+/* Custom subtle ambient grid background */
+.bg-mesh-pattern {
+  background-image:
+    radial-gradient(at 80% 20%, rgba(201, 166, 107, 0.18) 0px, transparent 50%),
+    radial-gradient(at 0% 50%, rgba(76, 138, 112, 0.22) 0px, transparent 50%),
+    radial-gradient(at 50% 100%, rgba(15, 46, 34, 0.14) 0px, transparent 50%);
+}
+
+.bg-dot-grid {
+  background-image: radial-gradient(rgba(155, 142, 105, 0.35) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Glassmorphism effects */
+.glass-panel {
+  background: rgba(244, 241, 234, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(201, 166, 107, 0.25);
+}
+
+/* ============================================================
+   DARK MODE
+   Toggled from the header avatar dropdown. The light Emerald &
+   Ivory palette lives in @theme above; this block overrides the
+   CSS variables under html[data-theme="dark"] so every Tailwind
+   utility re-resolves to a neutral charcoal palette.
+     #121212  charcoal black (background / surfaces)
+     #E0E0E0  primary text (light gray)
+     #B0B0B0  secondary text (medium gray)
+     #444444  borders (dark gray)
+   Gold, green (success) and red (error) accents are kept.
+   ============================================================ */
+html[data-theme="dark"] {
+  /* Black becomes the primary light accent (inverted CTA pills),
+     white becomes the dark surface color. */
+  --color-black: #e0e0e0;
+  --color-white: #1a1a1a;
+
+  /* Reversed neutral scale: text steps read light on dark surfaces */
+  --color-gray-50: #161616;
+  --color-gray-100: #242424;
+  --color-gray-200: #3a3a3a;
+  --color-gray-300: #444444;
+  --color-gray-400: #555555;
+  --color-gray-500: #707070;
+  --color-gray-600: #909090;
+  --color-gray-700: #b0b0b0;
+  --color-gray-800: #cfcfcf;
+  --color-gray-900: #e0e0e0;
+  --color-gray-950: #ededed;
+
+  /* Dark page background scale */
+  --color-slate-50: #121212;
+  --color-slate-100: #161616;
+  --color-slate-200: #222222;
+  --color-slate-300: #303030;
+  --color-slate-400: #3a3a3a;
+  --color-slate-500: #606060;
+  --color-slate-600: #888888;
+  --color-slate-700: #b0b0b0;
+  --color-slate-800: #cecece;
+  --color-slate-900: #e0e0e0;
+
+  color-scheme: dark;
+}
+
+html[data-theme="dark"] body {
+  background-color: #121212;
+  color: #e0e0e0;
+}
+
+html[data-theme="dark"] .glass-panel {
+  background: rgba(18, 18, 18, 0.85);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+html[data-theme="dark"] .bg-mesh-pattern {
+  background-image:
+    radial-gradient(at 80% 20%, rgba(68, 68, 68, 0.25) 0px, transparent 50%),
+    radial-gradient(at 0% 50%, rgba(48, 48, 48, 0.4) 0px, transparent 50%),
+    radial-gradient(at 50% 100%, rgba(30, 30, 30, 0.5) 0px, transparent 50%);
+}
+
+html[data-theme="dark"] .bg-dot-grid {
+  background-image: radial-gradient(rgba(85, 85, 85, 0.35) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+/* Keep the dashboard hero banner a dark charcoal gradient with light text. */
+html[data-theme="dark"] .dashboard-hero {
+  background-image: linear-gradient(to right, #0a0a0a, #121212 50%, #0d0d0d);
+  color: #e0e0e0;
+}
+
+html[data-theme="dark"] .dashboard-hero .text-gray-300,
+html[data-theme="dark"] .dashboard-hero .text-white {
+  color: #e0e0e0;
+}
+
+html[data-theme="dark"] .dashboard-hero .border-white\/20,
+html[data-theme="dark"] .dashboard-hero .border-white\/10 {
+  border-color: rgba(224, 224, 224, 0.25);
+}
+
+/* Keep modal/overlay scrims dark in dark mode. */
+html[data-theme="dark"] .overlay-backdrop {
+  background-color: rgba(0, 0, 0, 0.6);
+}

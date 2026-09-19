@@ -1,0 +1,134 @@
+PM2-PROCESS-MANAGER-AUTO-RESTART.txt
+=====================================
+
+Feature: Run under a process manager (PM2) for auto-restart (+ multi-core on
+         the production target)
+Project: RepoPilot (Backend)
+Date:    2026-09-12
+
+----------------------------------------------------------------------
+1. WHY THIS MATTERS
+----------------------------------------------------------------------
+If the server crashes despite all the hardening done so far (error
+middleware, unhandled-rejection nets, retry-with-backoff), we want it back
+up in seconds — not sitting dead until someone notices. PM2 supervises the
+process: it restarts on crash, rolls the process on out-of-memory, keeps
+out/error logs, and gives a single-command view of process health.
+
+The original task also asked for multi-core (`pm2 start ... -i max`, cluster
+mode) so 100 users' requests spread across worker processes. IMPORTANT
+PLATFORM LIMITATION: PM2's cluster mode is NOT reliable on Windows (years of
+open issues: spawn EBADF / ENOTSUP / ERR_UNSUPPORTED_ESM_URL_SCHEME; the
+community consensus is "don't use clusters on Windows"). This machine is
+WIN32 with 12 logical processors, so cluster mode would just error/loop.
+
+RESOLUTION: Use PM2 fork mode now (which fully delivers auto-restart and log
+management) and ship a ready-to-flick Linux cluster configuration in the
+ecosystem file for the real deployment target, where multi-core works natively.
+
+----------------------------------------------------------------------
+2. WHAT CHANGED
+----------------------------------------------------------------------
+Global install
+  - `npm install -g pm2`  (PM2 lives globally; per-project config lives in
+    Backend/ecosystem.config.cjs)
+
+Backend/ecosystem.config.cjs                (NEW — the single source of truth)
+  - Four PM2 apps managed together; two are active:
+
+    strata-api  : ./dist/index.js   (Express API server)
+        exec_mode: 'fork' | instances: 1
+        autorestart: true
+        max_memory_restart: '400M'        # roll the process if it leaks
+        kill_timeout: 10000               # lets SIGINT graceful drain finish
+                                            # (index.ts) before force-kill
+        restart_delay: 1000               # backoff between crash respawns
+        windowsHide: true                 # no console window spam on win32
+        out_file / error_file under ./logs/ (api-out.log, api-error.log)
+
+    strata-worker : ./dist/worker.js  (BullMQ index worker)
+        same hardening parameters.
+
+  - Documented in-file:
+      * LINUX CLUSTER RECIPE: switch the API block to
+        exec_mode: 'cluster', instances: 'max' (one worker per core) — that
+        is the `-i max` feature, natively supported on Linux.
+      * RATE LIMITING caveat: with multiple API processes the in-memory
+        express-rate-limit store becomes per-process, so the per-IP caps
+        multiply. At that point swap in a Redis-backed store
+        (rate-limit-redis) to keep the caps GLOBAL.
+      * Session store (connect-pg-simple) and BullMQ queue are already
+        multi-process safe — no code changes needed for clustering.
+
+Backend/package.json
+  - Scripts added:
+      pm2:start    -> pm2 start ecosystem.config.cjs
+      pm2:stop     -> pm2 stop ecosystem.config.cjs
+      pm2:restart  -> pm2 restart ecosystem.config.cjs
+      pm2:logs     -> pm2 logs
+      pm2:status   -> pm2 status
+
+Environment note
+  - The previous `npm run dev` (tsx watch) process on :3000 was stopped so
+    PM2 could own the port. Use `npm run dev` again only when not running
+    under PM2.
+
+----------------------------------------------------------------------
+3. RESULTING TOPOLOGY
+----------------------------------------------------------------------
+        PM2 daemon
+          |-- strata-api (fork)      : HTTP on :3000, session store = Postgres
+          |-- strata-worker (fork)   : consumes BullMQ 'repo-indexing' queue
+          v
+      Redis (jobs) <-> Postgres (sessions, data, sessions)
+
+All configuration, restart-on-crash, memory caps and logs are managed from
+`ecosystem.config.cjs` — one file, applied with `npm run pm2:start`.
+
+----------------------------------------------------------------------
+4. QUESTIONS ASKED (AND SUBMITTED ANSWERS)
+----------------------------------------------------------------------
+Question 1 - Windows multi-process
+  "PM2 cluster mode is unsupported on Windows. How should we get multi-process
+   on this machine?"
+  Answer submitted: "Fork now + Linux recipe (Recommended)"
+    -> PM2 runs the API and the worker in fork mode on this Windows machine
+       (auto-restart, logs, memory caps). The ecosystem file documents the
+       Linux cluster recipe (exec_mode 'cluster', instances 'max') to apply
+       at deployment. True multi-core therefore happens on the deployment
+       target, not on this dev machine.
+
+Question 2 - Start on boot
+  "Should PM2 also register the apps to start when Windows boots?"
+  Answer submitted: "No autostart (Recommended)"
+    -> No Windows startup service was registered. PM2 starts on command
+       (`npm run pm2:start`); boot resilience is deferred to the Linux
+       server (pm2 startup + pm2 save there).
+
+----------------------------------------------------------------------
+5. VERIFICATION PERFORMED
+----------------------------------------------------------------------
+- `npm install -g pm2`: installed (77 packages).
+- Port 3000 conflict removed: identified the old `tsx watch` tree
+  (cmd -> tsx cli -> node server) listening on :3000 and stopped it.
+- `pm2 start ecosystem.config.cjs`: both apps online:
+    strata-api    pid 24392   fork   online
+    strata-worker pid 25280   fork   online
+- HTTP check: GET / and GET /repos return 401 {"error":"Not authenticated"}
+  (expected for unauthenticated calls) — the API is serving under PM2.
+- Worker check: worker-out.log shows "listening on repo-indexing queue
+  (concurrency 2)".
+- AUTO-RESTART test: killed strata-api (Stop-Process, PID 24392). PM2
+  respawned it as PID 9400 (restart count ↺ 2) and the API kept working;
+  the worker stayed online throughout. Crash recovery confirmed.
+
+----------------------------------------------------------------------
+6. COMMON PM2 COMMANDS
+----------------------------------------------------------------------
+  npm run pm2:status   # process list, restart count, memory
+  npm run pm2:logs     # tail api + worker logs
+  npm run pm2:restart  # clean reload of both apps
+  npm run pm2:stop     # stop (keeps list registered)
+
+  # Linux deployment extras:
+  pm2 startup && pm2 save    # auto-start on boot (Linux only)

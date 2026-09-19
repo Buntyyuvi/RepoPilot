@@ -1,0 +1,116 @@
+REQUEST-LOGGING-AND-ERROR-TRACKING.txt
+======================================
+
+Feature: Lightweight request logging + opt-in error tracking (Sentry)
+Project: RepoPilot (Backend)
+Date:    2026-09-12
+
+----------------------------------------------------------------------
+1. WHY THIS MATTERS
+----------------------------------------------------------------------
+The app already had strong crash-hardening (central error middleware,
+unhandledRejection/uncaughtException nets, PM2 auto-restart with file logs),
+but there was NO per-request visibility. Under load you could not see which
+routes were hit, which status codes came back, or how long requests took,
+and an error line could not be tied back to the request that caused it.
+
+This change adds:
+  1. A per-request access log (morgan) with a correlation id.
+  2. Optional Sentry error tracking that is DORMANT until a DSN is set, so
+     production gets stack-trace alerts with zero further code changes.
+
+This is lightweight by design: no log framework, no strong-typed log
+schema, no log shipping - a few middleware lines plus an opt-in SDK.
+
+----------------------------------------------------------------------
+2. WHAT CHANGED
+----------------------------------------------------------------------
+npm
+  - Added dependencies: morgan, @types/morgan, @sentry/node.
+
+Backend/src/middleware/requestContext.ts      (NEW)
+  - Adds req.requestId (crypto.randomUUID()) to every request and echoes it
+    back as the X-Request-Id response header. Accepts a caller-supplied
+    X-Request-Id header if it matches a safe shape (useful behind a proxy
+    that already assigns ids).
+  - One id spans the whole lifecycle: it appears in the access-log line,
+    the response header, the error middleware's console.error prefix, and
+    any Sentry event - so a failing request is traceable end to end.
+
+Backend/src/index.ts
+  - dotenv.config({ quiet: true }) - stops the "injected env" banner that
+    otherwise pollutes every boot in the PM2 log files.
+  - Sentry.init runs ONLY when SENTRY_DSN is set:
+       environment = NODE_ENV ?? 'development'
+       tracesSampleRate = 0.1
+    No DSN => Sentry is never loaded/active (verified in logs).
+  - requestContext + a custom morgan format mounted after express.json()
+    and BEFORE the rate limiters, so limiter 429s are visible too:
+       [<requestId>] METHOD URL STATUS RESPONSE-TIMEms REMOTE-ADDR
+    e.g.  [0f057ade-9305-4eae-9ce6-247457268d4f] GET /auth/me 401 26.520ms ::1
+    Nothing sensitive is logged: no cookies, headers, authorization
+    material or request bodies.
+  - Error middleware: prefixes logs with [requestId] and (when Sentry is
+    enabled) calls Sentry.captureException(err, { tags: { requestId } }).
+
+Backend/src/worker.ts
+  - dotenv loaded quietly.
+  - Sentry.init guarded by SENTRY_DSN (same settings as the API server).
+  - The worker's "failed" handler also reports to Sentry when enabled, with
+    a fullName tag so failed index jobs are identifiable.
+
+Backend/src/config/database.ts, src/config/passport.ts
+  - dotenv made quiet in both files too (database.ts loaded dotenv via
+    `import "dotenv/config"`, which was the actual source of the boot banner).
+
+Backend/.env.example
+  - Documented SENTRY_DSN= (empty = disabled). Sentry free tier ~5k
+    errors/month; request id is attached to every reported event.
+
+----------------------------------------------------------------------
+3. LOG/VISIBILITY MODEL NOW
+----------------------------------------------------------------------
+  Every HTTP request   -> morgan line in logs/api-out.log with request id
+  API errors            -> console.error("[<id>] Unhandled error:") into
+                           api-error.log + Sentry (if DSN set)
+  Index worker failures -> worker-error.log + Sentry (if DSN set)
+  Process crashes       -> PM2 auto-restart already in place
+
+The two log formats in index.ts show exactly the tradeoff: morgan gives
+visibility cheaply at the request layer; Sentry adds proactive production
+alerting beyond what file logs and PM2 can do.
+
+----------------------------------------------------------------------
+4. QUESTIONS ASKED (AND SUBMITTED ANSWERS)
+----------------------------------------------------------------------
+Question 1 - Sentry integration
+  "Include Sentry error tracking (dormant unless a DSN is configured)?"
+  Answer submitted: "Opt-in Sentry (Recommended)"
+    -> @sentry/node is added, but Sentry.init only runs when SENTRY_DSN is
+       present in the environment. Locally it stays dormant (verified: no
+       "Sentry error tracking enabled" banner with no DSN); on a production
+       deploy, setting the DSN activates crash/error alerting with zero
+       further code changes.
+
+Question 2 - Log format
+  "Which request-log format?"
+  Answer submitted: "Custom + request id (Recommended)"
+    -> A compact custom morgan format including the request id, method,
+       url, status, response-time, and remote address was implemented -
+       skipping Apache 'combined' noise and adding the traceability value.
+
+----------------------------------------------------------------------
+5. VERIFICATION PERFORMED
+----------------------------------------------------------------------
+- npm run build (tsc): clean.
+- pm2 restart ecosystem.config.cjs: both apps online (fork mode).
+- Request logging: hit / and /auth/me; api-out.log shows:
+      [470b366e-...] GET / 401 24.361ms ::1
+      [39e228b5-...] GET /auth/me 401 3.351ms ::1
+- Correlation: curl -D - confirmed the response carries the same id the log
+  shows, e.g. X-Request-Id: 0f057ade-... appearing in both the header and
+  the log line.
+- Sentry dormant with no DSN: grep of the API log shows no Sentry banner.
+- Boot noise removed: the "injected env" banners are gone from the PM2 log
+  after making dotenv quiet in index/worker/database/passport.
+- Worker boot clean under PM2 (queue connection intact).

@@ -1,0 +1,101 @@
+Backend Troubleshooting
+=======================
+
+Date checked: 2026-09-04
+
+1. Error: Cannot find module 'express-session'
+------------------------------------------------
+Where it happened:
+  src/index.ts imports express-session.
+
+Why it happened:
+  express-session was used by the application, but it was not installed in
+  package.json dependencies. @types/express-session was present only for
+  TypeScript type checking; type packages do not provide the runtime module.
+
+Solution:
+  Install the runtime package:
+
+    npm install express-session
+
+  After installation, verify it with:
+
+    npm ls express-session --depth=0
+
+  Expected result:
+
+    express-session@1.19.0
+
+Status:
+  Fixed. npm run dev now starts successfully.
+
+2. Error: ts-node-dev crashed while reading TypeScript configuration
+--------------------------------------------------------------------
+Error message:
+  TypeError: Cannot read properties of undefined (reading 'fileExists')
+
+Why it happened:
+  The project uses TypeScript 7, while the installed ts-node/ts-node-dev
+  toolchain was not compatible with that TypeScript version.
+
+Solution:
+  Replace ts-node-dev scripts with tsx and remove the incompatible package:
+
+    npm install -D tsx
+    npm uninstall -D ts-node-dev
+
+  The project now uses:
+
+    "db:check": "tsx src/scripts/check-db.ts"
+    "dev": "tsx watch src/index.ts"
+
+Status:
+  Fixed.
+
+3. Error: Top-level await is not allowed in check-db.ts
+--------------------------------------------------------
+Error message:
+  TS1309: The current file is a CommonJS module and cannot use 'await' at
+  the top level.
+
+Why it happened:
+  The TypeScript configuration emits CommonJS-compatible code, but the
+  database check script used await outside an async function.
+
+Solution:
+  Put the connection check inside an async main() function and call it with:
+
+    void main();
+
+Status:
+  Fixed. npm run build passes.
+
+4. Docker container name conflict
+----------------------------------
+Error message:
+  Conflict. The container name "/devpilot-postgres" is already in use.
+
+Why it happened:
+  An old stopped container already used the hard-coded container name.
+
+Solution:
+  Remove container_name from docker-compose.yml. Docker Compose now creates
+  a project-scoped name such as backend-postgres-1 and can manage the service
+  without colliding with unrelated old containers.
+
+Status:
+  Fixed without deleting the old container.
+
+Useful verification commands
+----------------------------
+
+  docker compose up -d
+  docker compose config
+  npm run db:check
+  npm run build
+  npm run dev
+
+Current verification result:
+  PostgreSQL connection is healthy.
+  TypeScript build passes.
+  Development server starts at http://localhost:3000.

@@ -1,0 +1,159 @@
+IMPLEMENTATION NOTES
+====================
+
+Feature: Move indexing off the request/response cycle into a background queue
+Project: RepoPilot (Backend)
+Date:    2026-09-12
+
+----------------------------------------------------------------------
+1. PROBLEM
+----------------------------------------------------------------------
+Indexing a repository (fetching its tree, chunking every file, and
+generating embeddings via the AI provider) is slow and CPU-heavy. It was
+previously kicked off directly inside the POST /repos/:owner/:repo/index
+request handler as a fire-and-forget async function (beginIndexing in
+services/indexing.ts), tracked in an in-memory Map that only survived the
+lifetime of the server process.
+
+While one repo was indexing, that work shared Node's single event loop
+with every other user request. With 100 users, several clicking "Index
+now" around the same time could effectively freeze the whole app.
+
+Fix implemented: indexing was moved into a background job queue backed by
+BullMQ + Redis. The API now responds instantly with "indexing started",
+and a separate worker process (dist/worker.js) performs the actual
+chunking/embedding work, two repos at a time, never blocking the main
+server.
+
+----------------------------------------------------------------------
+2. WHAT CHANGED
+----------------------------------------------------------------------
+Backend/docker-compose.yml
+  - Added a `redis` service (redis:7-alpine) alongside postgres:
+    host port ${REDIS_HOST_PORT:-6379}, redis-cli ping healthcheck,
+    persistent volume repopilot-redis-data.
+
+Backend/.env.example
+  - Added REDIS_HOST=127.0.0.1 and REDIS_PORT=6379 (defaults already
+    match the local Docker Compose redis service, so an existing .env
+    needs no changes).
+
+Backend/src/queue/indexQueue.ts  (NEW)
+  - Single shared Redis connection settings (redisConnection) reused by
+    both the producer and the worker.
+  - `indexQueue = new Queue('repo-indexing', { connection: redisConnection })`.
+    The API server only ever adds jobs here; enqueuing returns instantly.
+
+Backend/src/services/indexing.ts  (REWORKED)
+  - Removed: beginIndexing(), getIndexJob(), the in-memory `jobs` Map,
+    the old IndexJob type. A server restart no longer wipes job state
+    (jobs live in Redis now).
+  - Kept: chunkFile, shouldSkip, runWithConcurrency (unchanged logic).
+  - Added: runIndexing(userId, fullName, branch, onProgress) - the pure
+    indexing pipeline now lives here and only ever runs inside the worker
+    process. It resolves the user's GitHub token via findUserById +
+    getValidAccessToken (including refresh), deletes the repo's previous
+    chunks, fetches the tree, chunks+embeds files with concurrency 3, then
+    ensures the pgvector similarity index. Progress is pushed through
+    onProgress({ processed, total, chunkCount }) after every file.
+
+Backend/src/worker.ts  (NEW - separate process)
+  - Loads dotenv, initializes the DB schema, and starts
+    Worker('repo-indexing', processor, { connection, concurrency: 2 }).
+  - The processor calls runIndexing(...) and forwards progress to
+    job.updateProgress(...). Any thrown error fails the BullMQ job, so the
+    failedReason is surfaced by the status endpoint.
+  - Logs completed/failed jobs; graceful shutdown on SIGINT/SIGTERM
+    (worker.close() -> closeDatabase() -> exit 0, 10s force-exit fallback).
+
+Backend/src/routes/repos.ts  (index + status endpoints only)
+  - POST /repos/:owner/:repo/index:
+      * Keeps persisting the connected-repo metadata first (one quick
+        GitHub call so the repo shows on the dashboard immediately).
+      * Dedup: because each repo uses a fixed jobId (fullName), it first
+        checks Job.fromId; if a job exists and is waiting/delayed/active/
+        paused, it returns 202 with the running job instead of queueing a
+        duplicate (replaces the old "running" dedup check).
+      * Otherwise indexQueue.add('index', { userId, fullName, branch },
+        { jobId: fullName }) - the response returns immediately.
+      * If Redis/unavailable (add throws), returns 503
+        "Indexing service is unavailable" instead of a generic 500.
+  - GET /repos/:owner/:repo/index/status:
+      * Reads the job via Job.fromId + getState() + progress + failedReason.
+      * State mapping: completed -> "done", failed -> "error" (with
+        failedReason as error), anything else -> "running".
+      * Completed/failed jobs are retained (BullMQ default), so polling
+        reliably observes the terminal state - same shape the frontend
+        already expects ({ job: { status, total, processed, chunkCount,
+        error } | null, indexedChunks }).
+
+Backend/package.json
+  - Dependencies added: bullmq, ioredis.
+  - Scripts added:
+      "worker":      "node dist/worker.js"
+      "dev:worker":  "tsx watch src/worker.ts"
+
+Frontend: NO changes required - the API response shapes and the
+running/done/error semantics are preserved exactly.
+
+----------------------------------------------------------------------
+3. REQUEST FLOW (BEFORE vs AFTER)
+----------------------------------------------------------------------
+BEFORE:
+  POST /index  -> beginIndexing() starts heavy chunking/embedding inline
+                  (blocking the event loop, tracked only in memory)
+  GET /status  -> reads the in-memory Map
+
+AFTER:
+  POST /index  -> persist metadata -> indexQueue.add(...) -> 202 "running"
+                  (returns in milliseconds)
+  [Redis]      -> a 'repo-indexing' job is stored, deduped per repo
+  worker.js    -> polls the queue, picks up the job, resolves the user's
+                  GitHub token, chunky/embeds, updates job progress
+  GET /status  -> reads job state/progress from Redis via BullMQ, plus the
+                  live code_chunks count
+
+----------------------------------------------------------------------
+4. QUESTIONS ASKED (AND SUBMITTED ANSWERS)
+----------------------------------------------------------------------
+Question 1 - Redis provisioning
+  "BullMQ requires a running Redis. How should we provide it?"
+  Answer submitted: "Add to docker-compose (Recommended)"
+    -> A redis service was added to docker-compose.yml; start it with
+       `docker compose up -d redis`.
+
+Question 2 - Worker concurrency
+  "How many indexing jobs should the worker run in parallel?"
+  Answer submitted: "2 (Recommended)"
+    -> Worker({ concurrency: 2 }) - two repos index at a time, never
+       blocking the API server.
+
+----------------------------------------------------------------------
+5. HOW TO RUN
+----------------------------------------------------------------------
+1. docker compose up -d redis            (first time only / after pulls)
+2. npm run build                          (compiles dist/)
+3. In one terminal:   npm run worker      (or npm run dev:worker)
+4. In another:        npm start           (or npm run dev)
+   - You do NOT need to run npm start if your dev server is already up,
+     but it MUST be restarted to pick up the new code.
+
+----------------------------------------------------------------------
+6. VERIFICATION PERFORMED
+----------------------------------------------------------------------
+- `npm run build` (tsc): clean, no errors.
+- Redis brought up via docker compose; redis-cli ping -> PONG.
+- Worker + server booted: "Worker: listening on repo-indexing queue
+  (concurrency 2)" and "Strata server listening on http://localhost:3000"
+  (the local test server on port 3000 was already occupied by the
+  pre-existing dev server, confirming the EADDRINUSE exit path works).
+- Full queue round-trip probe (no auth needed):
+    Queue.add() a job -> picked up by the worker -> processor rejected it
+    (nonexistent user -> TokenRefreshError) -> job state observed as
+    "failed" with failedReason "User not found; re-authentication is
+    required." (the exact data the status endpoint reads). Probe job was
+    cleaned up afterwards.
+
+NOTE: A true end-to-end "index a real repo to done" run still needs a
+logged-in GitHub session. The mechanics verified above are exactly the
+code used when a real user clicks "Index now".

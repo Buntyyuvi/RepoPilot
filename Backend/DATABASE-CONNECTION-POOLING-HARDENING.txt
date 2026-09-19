@@ -1,0 +1,117 @@
+DATABASE-CONNECTION-POOLING-HARDENING.txt
+==========================================
+
+Feature: Use connection pooling for the database (Postgres)
+Project: RepoPilot (Backend)
+Date:    2026-09-12
+
+----------------------------------------------------------------------
+1. WHY THIS MATTERS
+----------------------------------------------------------------------
+A database client must never open a new connection per request. With 100
+concurrent users each grabbing their own connection, Postgres's connection
+limit is exhausted quickly (Supabase's free tier caps around 60 direct
+connections; the local Docker image defaults to 100). A shared connection
+pool reuses a fixed set of connections instead, so the database is never
+overwhelmed by client count.
+
+----------------------------------------------------------------------
+2. WHAT WAS ALREADY CORRECT AT START
+----------------------------------------------------------------------
+The codebase does NOT use an ORM (no Prisma). It uses `pg` directly via a
+single shared `pg.Pool` in src/config/database.ts:
+  - `new Pool({ ... })` with explicit `max` (default 10, tunable via
+    POSTGRES_POOL_MAX).
+  - Every model (user, codeChunk, connectedRepo) goes through one shared
+    `query()` helper - grep confirmed there is NO `new Client` per request
+    anywhere.
+  - The DATABASE_URL path (Supabase-style connection string) still applies
+    `max` on top of the pooled config.
+  - db.on("error") already logs unexpected pool errors.
+
+Connection math for local dev:
+  - API server process : up to 10 pooled connections
+  - Worker process     : up to 10 pooled connections
+  - Total              : up to 20 << Postgres default max_connections (100)
+
+So requirements like "use a pool, not a new connection per request" and
+"set an explicit sane limit" were already satisfied by the existing design.
+
+----------------------------------------------------------------------
+3. CHANGES IMPLEMENTED NOW
+----------------------------------------------------------------------
+Backend/src/config/database.ts
+  - Added `query_timeout` (default 20000 ms, tunable via
+    POSTGRES_QUERY_TIMEOUT_MS) to the Pool options. Any query that runs
+    longer than this is cancelled, so a slow statement (embedding inserts
+    during indexing are the main candidates) can never pin a pooled
+    connection indefinitely.
+
+Backend/.env.example
+  - Documented POSTGRES_POOL_MAX (default 10) - the SANE, EXPLICIT pool
+    limit. With `pg` this is the `max` option; the `?connection_limit=10`
+    URL flag mentioned in the task is a Prisma-only convention and is not
+    read by node-postgres.
+  - Documented POSTGRES_QUERY_TIMEOUT_MS (default 20000).
+  - Added a comment block explaining the Supabase connection pooler for a
+    possible future migration (documented only - NOT applied, because we
+    are staying on the self-hosted pgvector Docker image).
+
+----------------------------------------------------------------------
+4. WHY NO PgBouncer SIDECAR (DECISION + RATIONALE)
+----------------------------------------------------------------------
+The task suggested switching to PgBouncer (port 6543) "for anything
+serverless or with many short-lived connections". This app is neither:
+  - The API server and the index worker are long-lived Node processes that
+    hold pooled connections open and reuse them.
+  - There is no per-request connection creation to buffer.
+Therefore a PgBouncer container would add operational complexity with zero
+benefit in the current deployment. It is intentionally NOT added.
+
+Rule of thumb we followed:
+  - Static/long-lived Node processes + one Postgres  -> pg.Pool is enough.
+  - Serverless/edge functions opening fresh connections -> use the
+    Supabase connection pooler (transaction mode, port 6543) via
+    DATABASE_URL; with `pg` size the pool with POSTGRES_POOL_MAX.
+
+----------------------------------------------------------------------
+5. FINAL CONFIG SUMMARY (src/config/database.ts)
+----------------------------------------------------------------------
+  new Pool({
+    ...poolConfig,                       // individual vars OR DATABASE_URL
+    max:                POSTGRES_POOL_MAX ?? 10,            // per process
+    idleTimeoutMillis:  30_000,          // close idle connections
+    connectionTimeoutMillis: 5_000,      // don't hang acquiring a conn
+    query_timeout:      POSTGRES_QUERY_TIMEOUT_MS ?? 20_000 // cancel slow queries
+  })
+
+Figures per running process: server (server + worker together use 2 * max
+= 20 total locally), well under the Docker image's 100-connection default.
+
+----------------------------------------------------------------------
+6. QUESTIONS ASKED (AND SUBMITTED ANSWERS)
+----------------------------------------------------------------------
+Question 1 - Deployment target
+  "Where will this app run in production? (This decides whether to add
+   PgBouncer and which pool guidance to bake in.)"
+  Answer submitted: "Stay on Docker Postgres (Recommended)"
+    -> Keep using the self-hosted pgvector Docker image. Plan: keep
+       pg.Pool, document Supabase guidance in .env.example, do NOT add a
+       PgBouncer sidecar.
+
+Question 2 - Pool hardening
+  "Which optional pool-hardening items should I include?"
+  Answer submitted: "Add query_timeout (Recommended)"
+    -> A 20s query_timeout was added to the Pool config so slow embedding
+       inserts cannot pin a pooled connection forever. The other offered
+       options (maxUses, no-code-change) were not selected.
+
+----------------------------------------------------------------------
+7. VERIFICATION PERFORMED
+----------------------------------------------------------------------
+- `npm run build` (tsc): clean, no errors after the database.ts change.
+- Grep reviewed the codebase for `new Pool` / `new Client` to confirm the
+  single-pool design and rule out per-request connections.
+- Config is applied the same way for both connection paths (individual
+  POSTGRES_* variables and DATABASE_URL), so behaviour is identical when
+  switching to a hosted database later.

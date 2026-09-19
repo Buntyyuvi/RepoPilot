@@ -1,0 +1,135 @@
+RATE-LIMITING-AND-UPSTREAM-429-RETRY.txt
+=========================================
+
+Feature: Rate-limit our own API and handle upstream 429s gracefully
+Project: RepoPilot (Backend)
+Date:    2026-09-12
+
+----------------------------------------------------------------------
+1. WHY THIS MATTERS
+----------------------------------------------------------------------
+Two upstream APIs enforce hard limits regardless of our server's capacity:
+  - GitHub: 5,000 requests/hour per user token (fine per-user, but a burst
+    of repos indexing at once can hammer it).
+  - Gemini / OpenRouter: a low requests-per-minute cap.
+
+If 100 users trigger indexing around the same time, we get a burst of 429
+(rate limited) errors. Without protection this both:
+  (a) lets one client / a health-check misfire consume unlimited API calls,
+  and
+  (b) crashes individual requests the moment an upstream replies 429 —
+      a transient limit turns into failed indexing jobs and chat errors.
+
+The fix has two halves:
+  1. Cap OUR API with express-rate-limit so any single IP cannot overload
+     our upstreams.
+  2. Add retry-with-backoff around every upstream call so a temporary 429
+     waits and retries instead of throwing immediately.
+
+----------------------------------------------------------------------
+2. WHAT CHANGED
+----------------------------------------------------------------------
+npm
+  - Added dependency: express-rate-limit (ships its own TS types).
+
+Backend/src/middleware/rateLimit.ts            (NEW)
+  - apiLimiter  : 60s window, 120 requests/min/IP on every API route
+                  (env: RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX).
+  - authLimiter : 60s window, 10 requests/min/IP on the GitHub OAuth entry
+                  points (env: AUTH_RATE_LIMIT_MAX) so a single IP cannot
+                  spam consent redirects / relink flows.
+  - In-memory store (express-rate-limit default), correct for the current
+    single-instance deployment; documented that multi-instance deployments
+    should swap in a Redis-backed store.
+  - standardHeaders 'draft-7' emits RateLimit-* headers the frontend can
+    read; legacyHeaders disabled.
+
+Backend/src/lib/retryWithBackoff.ts            (NEW)
+  - withRetry(fn, { maxRetries = 3, baseDelayMs = 1000, maxDelayMs = 30000,
+    isRetryable }) - runs fn, and on a retryable error sleeps an exponential
+    delay (1000ms, 2000ms, 4000ms... capped at 30s) before retrying.
+  - Honors an upstream Retry-After hint when present (reads Octokit's
+    error.response.headers['retry-after'] or a retryAfterSeconds field on
+    AIError) and prefers it over the exponential guess.
+  - defaultIsRetryable: retries HTTP 429 and transient 5xx only; 4xx
+    validation errors, auth failures, 404s, etc. propagate immediately.
+  - After exhausting retries, the LAST error is rethrown unchanged so
+    callers keep their existing 429/401 mapping (ChatView, token refresh 401s).
+
+Backend/src/index.ts
+  - Mounted apiLimiter before the routers (after session/passport) and
+    authLimiter on the /auth/github prefix, which stacks with the global cap:
+        app.use(apiLimiter);
+        app.use('/auth/github', authLimiter);
+        app.use(authRouter);
+        app.use(reposRouter);
+
+Backend/src/services/ai.ts
+  - openrouterFetch and geminiFetch bodies are wrapped in withRetry, so BOTH
+    embeddings (index worker, per-chunk) and chat answers retry on 429/5xx.
+  - AIError gained an optional retryAfterSeconds arg parsed from the upstream
+    Retry-After header, which withRetry then honors.
+  - After retries exhaust, AIError(429) still propagates: chat routes keep
+    returning 429 to the client, and a persistently rate-limited index job
+    fails with a clear reason exactly as before.
+
+Backend/src/services/github.ts
+  - TokenRefreshError gained an optional status so withRetry can tell a
+    transient OAuth 429/5xx (retry) from a real auth failure (rethrow -> 401).
+  - refreshAccessToken: wrapped the raw fetch endpoint exchange in withRetry.
+  - fetchUserRepos, fetchRepoTree, fetchFileContent: each Octokit call is
+    wrapped in withRetry (Octokit RequestError exposes .status = 429 and
+    response.headers Retry-After, which the helper reads).
+  - The index worker benefits automatically: it already calls these GitHub
+    service functions plus embedText, so bursts of concurrent indexing get
+    transient-retry protection for free.
+
+Backend/.env.example
+  - Documented RATE_LIMIT_WINDOW_MS=60000, RATE_LIMIT_MAX=120,
+    AUTH_RATE_LIMIT_MAX=10.
+
+----------------------------------------------------------------------
+3. REQUEST FLOW (429 HANDLING BEFORE vs AFTER)
+----------------------------------------------------------------------
+BEFORE:
+  Upstream 429 -> AIError/RequestError thrown immediately -> chat shows
+                  "rate limited" / indexing job fails on first 429.
+
+AFTER:
+  Our API cap  -> overshooting IP gets 429 from express-rate-limit.
+  Upstream 429 -> withRetry waits (Retry-After or exponential backoff),
+                  retries up to 3 times, THEN throws only if still limited.
+
+----------------------------------------------------------------------
+4. QUESTIONS ASKED (AND SUBMITTED ANSWERS)
+----------------------------------------------------------------------
+Question 1 - Rate limit structure
+  "How should the request rate limiter be structured?"
+  Answer submitted: "Global + stricter auth limiter (Recommended)"
+    -> apiLimiter (120 req/min/IP) on all API routes PLUS authLimiter
+       (10 req/min/IP) that is prefix-mounted on /auth/github and therefore
+       stacks on top of the global cap for the OAuth entry points.
+
+Question 2 - Limiter store
+  "Where should the rate-limit counters live?"
+  Answer submitted: "In-memory store (Recommended)"
+    -> Used express-rate-limit's default in-memory store. Correct for the
+       current single API instance (the index worker is a separate process
+       and serves no HTTP). A Redis-backed store is documented as the step
+       to take only when running multiple API instances.
+
+----------------------------------------------------------------------
+5. VERIFICATION PERFORMED
+----------------------------------------------------------------------
+- npm run build (tsc): clean after wrapping the upstream calls (one
+  TypeScript narrowing fix in refreshAccessToken was needed and applied).
+- Live server smoke test (fresh build on :3100):
+    * apiLimiter  : /repos responded 401 (unauthenticated) on requests 1-5,
+                    then 429 on request 6 with RATE_LIMIT_MAX=5.
+    * authLimiter : /auth/github redirected (302, GitHub consent) on requests
+                    1-3, then 429 on 4-5 with AUTH_RATE_LIMIT_MAX=3.
+- Retry helper unit probe: a stub that threw 429 twice then succeeded was
+  retried with backoff and completed on attempt 3 (elapsed ~300ms with a
+  100ms base delay), confirming the wait-and-retry behavior.
+- The unchanged surfaces (401s, 404s, 429s, index-failure reasons) were
+  verified against the existing routes' expectations.

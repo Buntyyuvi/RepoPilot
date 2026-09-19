@@ -1,0 +1,49 @@
+# Root-level notes and local files
+/*.txt
+/*.log
+/*.env
+.env
+.env.*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Node / frontend / backend dependencies
+node_modules/
+**/node_modules/
+
+# Build outputs
+build/
+dist/
+coverage/
+.vite/
+.cache/
+.next/
+*.tsbuildinfo
+
+# Logs
+logs/
+**/logs/
+*.log
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+
+# Local database and runtime artifacts
+*.sqlite
+*.sqlite3
+*.db
+*.pid
+*.pem
+
+# Local tool or environment artifacts
+*.local
+
+# Keep local project docs out of Git only when they are notes/debug files
+# The repo-level .txt files are intentionally ignored to avoid pushing notes and debugging logs.
